@@ -1,0 +1,102 @@
+# =============================================================================
+# Servicios en la instancia AWS EC2
+#
+#   app             Gestor de tareas (frontend + API). Envia trazas, metricas y
+#                   logs por OTLP al collector.
+#   otel-collector  OpenTelemetry Collector: recibe la telemetria de la app, mide
+#                   los recursos del servidor (CPU, RAM, red, disco, temperatura)
+#                   y lo reenvia todo a OpenObserve.
+#   node-exporter   Expone los sensores de temperatura del host (hwmon/thermal).
+#   openobserve     Plataforma de observabilidad (logs, metricas, trazas,
+#                   dashboards y alertas). Interfaz web en el puerto 5080.
+#
+# Las variables (imagen, credenciales) vienen del archivo .env que escribe el
+# pipeline a partir de los GitHub Secrets; ese archivo nunca se sube a Git.
+# =============================================================================
+name: taskmanager
+
+services:
+  app:
+    image: ${APP_IMAGE:?falta APP_IMAGE}
+    container_name: taskmanager-app
+    restart: unless-stopped
+    ports:
+      - "80:3000"
+      - "6061:6061"
+    environment:
+      NODE_ENV: production
+      HOST_NAME: ${EC2_NAME:-ec2}
+      OTEL_SERVICE_NAME: taskmanager-api
+      # El collector usa la red del host; desde el contenedor se llega por host-gateway
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://host.docker.internal:4318
+      OTEL_METRIC_EXPORT_INTERVAL: "10000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - taskmanager-data:/app/data
+    depends_on:
+      - otel-collector
+    mem_limit: 256m
+    logging: &log-config
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    container_name: taskmanager-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    # Red del host: asi las metricas de red son las de la EC2 y no las del contenedor
+    network_mode: host
+    environment:
+      O2_AUTH: ${O2_AUTH:?falta O2_AUTH}
+      HOST_NAME: ${EC2_NAME:-ec2}
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+      # El sistema de archivos del host (solo lectura) para medir CPU, RAM, red y disco
+      - /:/hostfs:ro
+    depends_on:
+      - openobserve
+    mem_limit: 160m
+    logging: *log-config
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: taskmanager-node-exporter
+    restart: unless-stopped
+    network_mode: host
+    command:
+      - --path.rootfs=/host
+      - --collector.disable-defaults
+      - --collector.hwmon
+      - --collector.thermal_zone
+      - --web.listen-address=127.0.0.1:9100
+    volumes:
+      - /:/host:ro,rslave
+    mem_limit: 48m
+    logging: *log-config
+
+  openobserve:
+    image: public.ecr.aws/zinclabs/openobserve:latest
+    container_name: taskmanager-openobserve
+    restart: unless-stopped
+    ports:
+      - "5080:5080"
+    environment:
+      ZO_DATA_DIR: /data
+      # Solo se usan la primera vez que arranca (cuando /data esta vacio)
+      ZO_ROOT_USER_EMAIL: ${O2_USER:?falta O2_USER}
+      ZO_ROOT_USER_PASSWORD: ${O2_PASSWORD:?falta O2_PASSWORD}
+      ZO_TELEMETRY: "false"
+      # Ajustes para una instancia pequena (t3.micro / t3.small)
+      ZO_MEMORY_CACHE_MAX_SIZE: "128"
+      ZO_MEMORY_CACHE_DATAFUSION_MAX_SIZE: "128"
+      ZO_MAX_FILE_SIZE_IN_MEMORY: "64"
+    volumes:
+      - openobserve-data:/data
+    mem_limit: 600m
+    logging: *log-config
+
+volumes:
+  taskmanager-data:
+  openobserve-data:

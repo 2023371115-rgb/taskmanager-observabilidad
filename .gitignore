@@ -1,0 +1,17 @@
+node_modules/
+coverage/
+data/
+backups/
+*.db
+*.log
+
+# Secretos: NUNCA subir al repositorio
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Reportes de Playwright
+playwright-report/
+test-results/

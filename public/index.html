@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gestor de Tareas</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="barra">
+    <h1>Gestor de Tareas</h1>
+    <span class="estado" data-testid="estado-servicio">Conectando…</span>
+  </header>
+
+  <main class="contenido">
+    <section class="panel" aria-labelledby="titulo-nueva">
+      <h2 id="titulo-nueva">Nueva tarea</h2>
+      <form id="form-tarea" data-testid="form-tarea" novalidate>
+        <label for="input-titulo">Título</label>
+        <input id="input-titulo" data-testid="input-titulo" name="titulo" maxlength="200" placeholder="¿Qué hay que hacer?" autocomplete="off">
+        <label for="select-categoria">Categoría</label>
+        <select id="select-categoria" data-testid="select-categoria" name="categoria">
+          <option value="">Sin categoría</option>
+        </select>
+        <button type="submit" data-testid="btn-agregar">Agregar</button>
+      </form>
+    </section>
+
+    <section class="panel lista" aria-labelledby="titulo-lista">
+      <div class="encabezado-lista">
+        <h2 id="titulo-lista">Tareas</h2>
+        <div class="filtros" role="group" aria-label="Filtrar tareas">
+          <button type="button" class="filtro activo" data-filtro="todas" data-testid="filtro-todas">Todas</button>
+          <button type="button" class="filtro" data-filtro="pendientes" data-testid="filtro-pendientes">Pendientes</button>
+          <button type="button" class="filtro" data-filtro="completadas" data-testid="filtro-completadas">Completadas</button>
+        </div>
+      </div>
+      <p class="contador" data-testid="contador">0 tareas</p>
+      <ul id="lista-tareas" data-testid="lista-tareas"></ul>
+      <p class="vacio" data-testid="lista-vacia" hidden>No hay tareas para mostrar.</p>
+    </section>
+
+    <section class="panel" aria-labelledby="titulo-categorias">
+      <h2 id="titulo-categorias">Categorías</h2>
+      <form id="form-categoria" data-testid="form-categoria" novalidate>
+        <label for="input-categoria">Nombre</label>
+        <input id="input-categoria" data-testid="input-categoria" maxlength="50" placeholder="Nueva categoría" autocomplete="off">
+        <button type="submit" data-testid="btn-agregar-categoria">Agregar categoría</button>
+      </form>
+      <ul id="lista-categorias" data-testid="lista-categorias"></ul>
+    </section>
+  </main>
+
+  <div id="aviso" class="aviso" role="status" aria-live="polite" data-testid="aviso" hidden></div>
+
+  <footer class="pie">
+    <span data-testid="version">versión —</span> ·
+    <span data-testid="commit">commit —</span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

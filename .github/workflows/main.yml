@@ -1,0 +1,259 @@
+# =============================================================================
+# Pipeline CI/CD - Gestor de tareas con observabilidad
+#
+#   1. pruebas-backend   Jest + Supertest, cobertura minima del 70 %
+#   2. pruebas-e2e       Playwright: interfaz web y API con la app real levantada
+#   3. build-push        Imagen Docker (:latest y :sha) en Docker Hub
+#   4. deploy            SSH a AWS EC2: docker compose (app, OpenObserve,
+#                        OpenTelemetry Collector) y verificacion de /api/health
+#   5. registrar         SIEMPRE: envia a OpenObserve el resultado de cada job,
+#                        commit, rama y usuario, y el evento de despliegue
+#
+# El despliegue esta condicionado: build-push necesita que 1 y 2 pasen y deploy
+# necesita build-push. Si una prueba falla, no hay imagen nueva ni conexion SSH.
+#
+# Secrets: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN, EC2_HOST, EC2_USER, EC2_SSH_KEY,
+#          OPENOBSERVE_USER, OPENOBSERVE_PASSWORD
+# =============================================================================
+name: CI/CD - Gestor de Tareas
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: taskmanager-observabilidad
+  APP_DIR: taskmanager
+
+jobs:
+  # ---------------------------------------------------------------------------
+  pruebas-backend:
+    name: 1. Pruebas backend (Jest)
+    runs-on: ubuntu-latest
+    outputs:
+      total: ${{ steps.resumen.outputs.total }}
+      fallidas: ${{ steps.resumen.outputs.fallidas }}
+      cobertura: ${{ steps.resumen.outputs.cobertura }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Ejecutar pruebas con cobertura (falla si es menor al 70 %)
+        run: npx jest --ci --coverage --json --outputFile=jest-resultados.json
+
+      - name: Resumen de pruebas y cobertura
+        id: resumen
+        if: always()
+        run: |
+          npm run coverage:summary || true
+          if [ -f jest-resultados.json ]; then
+            echo "total=$(jq '.numTotalTests' jest-resultados.json)" >> "$GITHUB_OUTPUT"
+            echo "fallidas=$(jq '.numFailedTests' jest-resultados.json)" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f coverage/coverage-summary.json ]; then
+            echo "cobertura=$(jq '.total.lines.pct' coverage/coverage-summary.json)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Guardar reporte de cobertura
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-cobertura
+          path: coverage/
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  pruebas-e2e:
+    name: 2. Pruebas E2E (Playwright)
+    runs-on: ubuntu-latest
+    outputs:
+      total: ${{ steps.resumen.outputs.total }}
+      fallidas: ${{ steps.resumen.outputs.fallidas }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Instalar Chromium para Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Ejecutar pruebas de frontend y backend
+        run: npx playwright test
+
+      - name: Resumen de Playwright
+        id: resumen
+        if: always()
+        run: |
+          F=playwright-report/resultados.json
+          if [ -f "$F" ]; then
+            OK=$(jq '.stats.expected' "$F"); MAL=$(jq '.stats.unexpected' "$F"); FLAKY=$(jq '.stats.flaky' "$F")
+            echo "total=$((OK + MAL + FLAKY))" >> "$GITHUB_OUTPUT"
+            echo "fallidas=$MAL" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Playwright"
+              echo ""
+              echo "| Aprobadas | Fallidas | Inestables |"
+              echo "|---|---|---|"
+              echo "| $OK | $MAL | $FLAKY |"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Guardar reporte de Playwright
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-playwright
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  build-push:
+    name: 3. Build y push a Docker Hub
+    needs: [pruebas-backend, pruebas-e2e]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Iniciar sesion en Docker Hub (Personal Access Token)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Construir y publicar imagen (:latest y :sha)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: 4. Despliegue en AWS EC2
+    needs: build-push
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparar archivos de despliegue y .env
+        env:
+          O2_USER: ${{ secrets.OPENOBSERVE_USER }}
+          O2_PASSWORD: ${{ secrets.OPENOBSERVE_PASSWORD }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          umask 077
+          {
+            echo "APP_IMAGE=${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${GITHUB_SHA}"
+            echo "EC2_NAME=Miserver"
+            echo "O2_USER=${O2_USER}"
+            echo "O2_PASSWORD=${O2_PASSWORD}"
+            echo "O2_AUTH=$(printf '%s:%s' "$O2_USER" "$O2_PASSWORD" | base64 -w0)"
+          } > deploy/.env
+          ls -la deploy
+
+      - name: Copiar docker-compose y configuracion a la EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "deploy/docker-compose.yml,deploy/otel-collector.yaml,deploy/desplegar.sh,deploy/.env"
+          target: ${{ env.APP_DIR }}
+          strip_components: 1
+
+      - name: Desplegar por SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          NUEVA_IMAGEN: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          APP_DIR: ${{ env.APP_DIR }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: NUEVA_IMAGEN,APP_DIR
+          command_timeout: 15m
+          script: |
+            chmod 600 ~/"$APP_DIR"/.env
+            bash ~/"$APP_DIR"/desplegar.sh "$NUEVA_IMAGEN"
+
+      - name: Verificar la app y OpenObserve desde internet
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          for i in $(seq 1 15); do
+            if RESP=$(curl -fsS "http://${EC2_HOST}/api/health"); then break; fi
+            sleep 4
+          done
+          echo "Respuesta de /api/health: $RESP"
+          echo "$RESP" | grep -q "$GITHUB_SHA" || { echo "El servidor no reporta el commit $GITHUB_SHA"; exit 1; }
+          O2=$(curl -s -o /dev/null -w '%{http_code}' "http://${EC2_HOST}:5080/healthz" || true)
+          echo "OpenObserve /healthz: $O2"
+          {
+            echo "## Despliegue verificado"
+            echo ""
+            echo "- Aplicacion: http://<EC2>/ responde con el commit \`${GITHUB_SHA}\`"
+            echo "- OpenObserve: http://<EC2>:5080 (HTTP $O2)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  registrar:
+    name: 5. Registrar ejecucion en OpenObserve
+    needs: [pruebas-backend, pruebas-e2e, build-push, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enviar resultados y eventos de despliegue (API HTTP/JSON)
+        env:
+          O2_URL: ${{ secrets.EC2_HOST && format('http://{0}:5080', secrets.EC2_HOST) || '' }}
+          O2_USER: ${{ secrets.OPENOBSERVE_USER }}
+          O2_PASSWORD: ${{ secrets.OPENOBSERVE_PASSWORD }}
+          R_EVENTO: ${{ github.event_name }}
+          R_JEST: ${{ needs.pruebas-backend.result }}
+          R_E2E: ${{ needs.pruebas-e2e.result }}
+          R_BUILD: ${{ needs.build-push.result }}
+          R_DEPLOY: ${{ needs.deploy.result }}
+          JEST_TOTAL: ${{ needs.pruebas-backend.outputs.total || 0 }}
+          JEST_FALLIDAS: ${{ needs.pruebas-backend.outputs.fallidas || 0 }}
+          JEST_COBERTURA: ${{ needs.pruebas-backend.outputs.cobertura || 0 }}
+          E2E_TOTAL: ${{ needs.pruebas-e2e.outputs.total || 0 }}
+          E2E_FALLIDAS: ${{ needs.pruebas-e2e.outputs.fallidas || 0 }}
+          IMAGEN: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          COMMIT_MSG: ${{ github.event.head_commit.message || github.event.pull_request.title || '' }}
+        run: bash scripts/registrar-openobserve.sh
